@@ -1,0 +1,63 @@
+#!/bin/bash
+# Publica um entregável HTML numa URL NEUTRA via GitHub Pages de uma organização:
+# https://<org>.github.io/<slug>/ - sem o seu username na URL.
+# Uso: publicar-limpo <arquivo.html|pasta> <slug>
+#   - arquivo.html  → vira index.html do repo
+#   - pasta         → conteúdo inteiro copiado (precisa ter index.html)
+# Um repo público por slug dentro da org; republicar o mesmo slug atualiza a mesma URL.
+# Config: nome da org em ~/.config/publicar-limpo/org (uma linha).
+# Requisitos: gh (autenticado com acesso à org), git, curl.
+set -euo pipefail
+
+SRC="${1:?uso: publicar-limpo <arquivo.html|pasta> <slug>}"
+SLUG="${2:?uso: publicar-limpo <arquivo.html|pasta> <slug>}"
+ORG_FILE="$HOME/.config/publicar-limpo/org"
+
+[ -f "$ORG_FILE" ] || { echo "configure a org: echo NOME-DA-ORG > $ORG_FILE" >&2; exit 1; }
+ORG=$(tr -d '[:space:]' < "$ORG_FILE")
+[ -e "$SRC" ] || { echo "origem não existe: $SRC" >&2; exit 1; }
+
+# 1. repo (cria se não existir)
+if ! gh repo view "$ORG/$SLUG" >/dev/null 2>&1; then
+  echo "criando repo $ORG/$SLUG ..."
+  gh repo create "$ORG/$SLUG" --public --disable-issues --disable-wiki >/dev/null
+fi
+
+# 2. monta working tree e faz push
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+git clone -q "https://github.com/$ORG/$SLUG.git" "$TMP/repo" 2>/dev/null \
+  || { git -C "$TMP" init -q -b main repo; git -C "$TMP/repo" remote add origin "https://github.com/$ORG/$SLUG.git"; }
+cd "$TMP/repo"
+find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+if [ -d "$SRC" ]; then
+  cp -R "$SRC"/. .
+  [ -f index.html ] || { echo "pasta sem index.html" >&2; exit 1; }
+else
+  cp "$SRC" index.html
+fi
+touch .nojekyll
+# noindex: link é para pessoas, não para buscadores
+grep -qi 'name="robots"' index.html \
+  || sed -i.bak '1s/^/<meta name="robots" content="noindex">\n/' index.html && rm -f index.html.bak
+git add -A
+git commit -qm "publica ${SLUG} ($(date +%Y-%m-%d))" 2>/dev/null || echo "nada mudou; conteúdo já publicado."
+git push -q origin main
+
+# 3. habilita o Pages (branch main, raiz) se ainda não estiver
+gh api "repos/$ORG/$SLUG/pages" >/dev/null 2>&1 \
+  || gh api "repos/$ORG/$SLUG/pages" -X POST -F "source[branch]=main" -F "source[path]=/" >/dev/null
+
+# 4. espera o build do Pages
+URL="https://$(echo "$ORG" | tr '[:upper:]' '[:lower:]').github.io/${SLUG}/"
+echo "aguardando build do Pages..."
+for i in $(seq 1 30); do
+  sleep 5
+  STATUS=$(gh api "repos/$ORG/$SLUG/pages" --jq '.status' 2>/dev/null || echo null)
+  [ "$STATUS" = "built" ] && break
+done
+if curl -sfo /dev/null "$URL"; then
+  echo "✅ publicado: $URL"
+else
+  echo "⚠️ build ainda propagando; confira em ~1 min: $URL"
+fi
