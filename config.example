@@ -1,0 +1,21 @@
+# Copie para ~/.config/publicar-limpo/config e preencha com os seus valores.
+
+# --- Cloudflare ---
+# Account ID: painel da Cloudflare, barra lateral direita de qualquer domínio.
+CF_ACCOUNT_ID=seu-account-id-aqui
+
+# --- Modo consolidado (padrão) ---
+# Um único projeto Cloudflare Pages hospeda TODOS os entregáveis, cada slug
+# numa subpasta. Assim você nunca cria projeto novo e nunca bate no limite
+# de 100 projetos por conta.
+FLOW_PROJECT="entregas"                       # nome do projeto no Cloudflare Pages
+FLOW_DOMAIN="entregas.seudominio.com"         # domínio custom apontado para o projeto
+FLOW_MIRROR="$HOME/entregas-site"             # espelho local; é o MESTRE do site, faça backup
+
+# Placeholder da raiz (o que aparece se abrirem o domínio sem slug)
+FLOW_ROOT_TITLE="Entregas"
+FLOW_ROOT_TEXT="Entregas privadas."
+
+# --- Integração opcional com WhatsApp ---
+# Caminho de um outbox JSON lido por um bot seu. Deixe vazio para desligar.
+OUTBOX=""

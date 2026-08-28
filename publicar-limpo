@@ -1,63 +1,180 @@
 #!/bin/bash
-# Publica um entregável HTML numa URL NEUTRA via GitHub Pages de uma organização:
-# https://<org>.github.io/<slug>/ - sem o seu username na URL.
-# Uso: publicar-limpo <arquivo.html|pasta> <slug>
-#   - arquivo.html  → vira index.html do repo
-#   - pasta         → conteúdo inteiro copiado (precisa ter index.html)
-# Um repo público por slug dentro da org; republicar o mesmo slug atualiza a mesma URL.
-# Config: nome da org em ~/.config/publicar-limpo/org (uma linha).
-# Requisitos: gh (autenticado com acesso à org), git, curl.
+# Publica um entregável HTML numa URL NEUTRA - sem username, sem "claude", sem NOXX.
+# Uso: publicar-limpo <arquivo.html|pasta> <slug> ["descrição p/ WhatsApp"] [grupo] [--isolado|--netlify]
+#   - arquivo.html  → vira index.html do site
+#   - pasta         → conteúdo inteiro (precisa ter index.html)
+# Modos:
+#   (PADRÃO, sem flag) → https://<seu-dominio>/<slug>/   1 ÚNICO projeto p/ tudo, cada slug é subpasta.
+#                        Recomendado p/ cliente. Nunca cria projeto novo → nunca bate no limite de 100 projetos/conta.
+#   --isolado          → https://<slug>.pages.dev        1 projeto Cloudflare por slug.
+#   --netlify          → https://<slug>.netlify.app      via API (zip deploy).
+#
+# Modo padrão (flow): consolida todos os entregáveis num único projeto Cloudflare Pages,
+#   servido no seu domínio. O diretório-espelho local (FLOW_MIRROR) é o MESTRE do site
+#   inteiro - faça backup dele. Cada publish escreve em <espelho>/<slug>/ e sobe a árvore
+#   toda (a Cloudflare só reenvia o que mudou).
+#
+# Config: ~/.config/publicar-limpo/config         (conta, domínio e projeto - veja config.example)
+#         ~/.config/publicar-limpo/cf-token       (Account · Cloudflare Pages · Edit)
+#         ~/.config/publicar-limpo/netlify-token  (Personal access token da Netlify, opcional)
 set -euo pipefail
 
-SRC="${1:?uso: publicar-limpo <arquivo.html|pasta> <slug>}"
-SLUG="${2:?uso: publicar-limpo <arquivo.html|pasta> <slug>}"
-ORG_FILE="$HOME/.config/publicar-limpo/org"
+CFG="$HOME/.config/publicar-limpo"
 
-[ -f "$ORG_FILE" ] || { echo "configure a org: echo NOME-DA-ORG > $ORG_FILE" >&2; exit 1; }
-ORG=$(tr -d '[:space:]' < "$ORG_FILE")
+# Valores pessoais (conta, domínio, projeto) vivem no arquivo de config, nunca aqui,
+# para que este script possa ser publicado como open source sem vazar nada.
+[ -f "$CFG/config" ] || {
+  echo "falta $CFG/config - copie o config.example do repositório e preencha" >&2; exit 1
+}
+# shellcheck disable=SC1090
+source "$CFG/config"
+
+: "${CF_ACCOUNT_ID:?defina CF_ACCOUNT_ID em $CFG/config}"
+: "${FLOW_PROJECT:?defina FLOW_PROJECT em $CFG/config}"
+: "${FLOW_DOMAIN:?defina FLOW_DOMAIN em $CFG/config}"
+: "${FLOW_MIRROR:?defina FLOW_MIRROR em $CFG/config}"
+FLOW_ROOT_TITLE="${FLOW_ROOT_TITLE:-Entregas}"
+FLOW_ROOT_TEXT="${FLOW_ROOT_TEXT:-Entregas privadas.}"
+OUTBOX="${OUTBOX:-}"
+
+# --- argumentos (flags podem vir em qualquer posição) ---
+# padrão = modo flow (consolidado). Flags trocam o modo.
+PROVIDER=cloudflare
+FLOW=1
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --netlify)              FLOW=0; PROVIDER=netlify ;;
+    --isolado|--cloudflare) FLOW=0; PROVIDER=cloudflare ;;
+    --entregas|--flow)      FLOW=1; PROVIDER=cloudflare ;;
+    --provider=*)           FLOW=0; PROVIDER="${a#*=}" ;;
+    *)                      ARGS+=("$a") ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+if [ $# -lt 2 ]; then
+  echo "uso: publicar-limpo <arquivo.html|pasta> <slug> [\"descrição\"] [grupo] [--isolado|--netlify]" >&2
+  exit 1
+fi
+SRC="$1"; SLUG="$2"; DESC="${3:-}"; GRUPO="${4:-Claude.html}"
 [ -e "$SRC" ] || { echo "origem não existe: $SRC" >&2; exit 1; }
 
-# 1. repo (cria se não existir)
-if ! gh repo view "$ORG/$SLUG" >/dev/null 2>&1; then
-  echo "criando repo $ORG/$SLUG ..."
-  gh repo create "$ORG/$SLUG" --public --disable-issues --disable-wiki >/dev/null
-fi
+inject_noindex() { # $1 = caminho do index.html
+  grep -qi 'name="robots"' "$1" \
+    || { sed -i.bak '1s/^/<meta name="robots" content="noindex">\n/' "$1"; rm -f "$1.bak"; }
+}
 
-# 2. monta working tree e faz push
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-git clone -q "https://github.com/$ORG/$SLUG.git" "$TMP/repo" 2>/dev/null \
-  || { git -C "$TMP" init -q -b main repo; git -C "$TMP/repo" remote add origin "https://github.com/$ORG/$SLUG.git"; }
-cd "$TMP/repo"
-find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
-if [ -d "$SRC" ]; then
-  cp -R "$SRC"/. .
-  [ -f index.html ] || { echo "pasta sem index.html" >&2; exit 1; }
+# --- 1. monta o diretório de deploy ---
+URL=""
+VERIFY_URL=""
+if [ "$FLOW" = "1" ]; then
+  # Modo consolidado (padrão): escreve o entregável na subpasta do espelho e sobe o site inteiro.
+  DEPLOYDIR="$FLOW_MIRROR"
+  PROJECT="$FLOW_PROJECT"
+  DEST="$FLOW_MIRROR/$SLUG"
+  mkdir -p "$FLOW_MIRROR"
+  # raiz precisa ter um index.html; cria um placeholder neutro se não existir
+  if [ ! -f "$FLOW_MIRROR/index.html" ]; then
+    printf '<!doctype html><meta charset="utf-8"><meta name="robots" content="noindex"><title>%s</title><p style="font:16px sans-serif;opacity:.6">%s</p>\n' \
+      "$FLOW_ROOT_TITLE" "$FLOW_ROOT_TEXT" > "$FLOW_MIRROR/index.html"
+  fi
+  rm -rf "$DEST"; mkdir -p "$DEST"
+  if [ -d "$SRC" ]; then
+    cp -R "$SRC"/. "$DEST/"
+    [ -f "$DEST/index.html" ] || { echo "pasta sem index.html" >&2; exit 1; }
+  else
+    cp "$SRC" "$DEST/index.html"
+  fi
+  inject_noindex "$DEST/index.html"
+  VERIFY_URL="https://${FLOW_PROJECT}.pages.dev/${SLUG}/"   # sempre resolve
+  PRETTY_URL="https://${FLOW_DOMAIN}/${SLUG}/"              # bonita (domínio próprio)
 else
-  cp "$SRC" index.html
+  # Modo isolado: 1 projeto por slug, diretório temporário.
+  TMP=$(mktemp -d)
+  ZIP="$TMP.zip"
+  trap 'rm -rf "$TMP" "$ZIP"' EXIT
+  DEPLOYDIR="$TMP"
+  PROJECT="$SLUG"
+  if [ -d "$SRC" ]; then
+    cp -R "$SRC"/. "$TMP/"
+    [ -f "$TMP/index.html" ] || { echo "pasta sem index.html" >&2; exit 1; }
+  else
+    cp "$SRC" "$TMP/index.html"
+  fi
+  inject_noindex "$TMP/index.html"
 fi
-touch .nojekyll
-# noindex: link é para pessoas, não para buscadores
-grep -qi 'name="robots"' index.html \
-  || sed -i.bak '1s/^/<meta name="robots" content="noindex">\n/' index.html && rm -f index.html.bak
-git add -A
-git commit -qm "publica ${SLUG} ($(date +%Y-%m-%d))" 2>/dev/null || echo "nada mudou; conteúdo já publicado."
-git push -q origin main
 
-# 3. habilita o Pages (branch main, raiz) se ainda não estiver
-gh api "repos/$ORG/$SLUG/pages" >/dev/null 2>&1 \
-  || gh api "repos/$ORG/$SLUG/pages" -X POST -F "source[branch]=main" -F "source[path]=/" >/dev/null
+# --- 2. deploy ---
+deploy_cloudflare() {
+  [ -f "$CFG/cf-token" ] || { echo "sem $CFG/cf-token" >&2; return 1; }
+  export CLOUDFLARE_API_TOKEN=$(tr -d '[:space:]' < "$CFG/cf-token")
+  export CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT_ID"
+  npx --yes wrangler pages project create "$PROJECT" --production-branch main >/dev/null 2>&1 || true
+  npx --yes wrangler pages deploy "$DEPLOYDIR" --project-name "$PROJECT" --branch main --commit-dirty=true >/dev/null || return 1
+  if [ "$FLOW" = "1" ]; then URL="$PRETTY_URL"; else URL="https://${PROJECT}.pages.dev/"; fi
+}
 
-# 4. espera o build do Pages
-URL="https://$(echo "$ORG" | tr '[:upper:]' '[:lower:]').github.io/${SLUG}/"
-echo "aguardando build do Pages..."
-for i in $(seq 1 30); do
+deploy_netlify() {
+  [ -f "$CFG/netlify-token" ] || { echo "sem $CFG/netlify-token" >&2; return 1; }
+  local tok site code
+  tok=$(tr -d '[:space:]' < "$CFG/netlify-token")
+  site="${SLUG}.netlify.app"
+  code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" \
+         "https://api.netlify.com/api/v1/sites/${site}") || return 1
+  if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+    echo "netlify: token inválido ou sem permissão (HTTP $code)" >&2; return 1
+  fi
+  if [ "$code" != "200" ]; then
+    curl -sS -X POST -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+         -d "{\"name\":\"${SLUG}\"}" https://api.netlify.com/api/v1/sites \
+      | grep -q '"id"' \
+      || { echo "netlify: não consegui criar o site '$SLUG' (nome já usado por outra conta?)" >&2; return 1; }
+  fi
+  (cd "$DEPLOYDIR" && zip -rq "$ZIP" .)
+  curl -sS -f -X POST -H "Authorization: Bearer $tok" -H 'Content-Type: application/zip' \
+       --data-binary "@$ZIP" "https://api.netlify.com/api/v1/sites/${site}/deploys" >/dev/null || return 1
+  URL="https://${site}/"
+}
+
+case "$PROVIDER" in
+  netlify)    deploy_netlify ;;
+  cloudflare) deploy_cloudflare || { echo "❌ deploy Cloudflare falhou" >&2; exit 1; } ;;
+  *) echo "provedor desconhecido: $PROVIDER" >&2; exit 1 ;;
+esac
+
+# --- 3. verifica a URL de produção ---
+CHECK_URL="${VERIFY_URL:-$URL}"
+for i in $(seq 1 12); do
+  curl -sfo /dev/null "$CHECK_URL" && break
   sleep 5
-  STATUS=$(gh api "repos/$ORG/$SLUG/pages" --jq '.status' 2>/dev/null || echo null)
-  [ "$STATUS" = "built" ] && break
 done
-if curl -sfo /dev/null "$URL"; then
+if curl -sfo /dev/null "$CHECK_URL"; then
   echo "✅ publicado: $URL"
+  [ "$FLOW" = "1" ] && echo "   (também abre em: $CHECK_URL)"
 else
-  echo "⚠️ build ainda propagando; confira em ~1 min: $URL"
+  echo "⚠️ deploy feito mas URL ainda propagando: $URL" >&2
+fi
+
+# --- 4. registra no catálogo de projetos (usado pelo resumo noturno) ---
+python3 - "$CFG/projetos.json" "$SLUG" "$URL" <<'PYEOF'
+import json, sys, os
+f, slug, url = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(f)) if os.path.exists(f) else {}
+atual = d.get(slug)
+nome = atual if isinstance(atual, str) else (atual or {}).get("nome") or slug.replace('-', ' ').title()
+d[slug] = {"nome": nome, "url": url}
+json.dump(d, open(f, 'w'), ensure_ascii=False, indent=2)
+PYEOF
+
+# --- 5. WhatsApp (opcional): só se houver descrição E outbox configurado ---
+if [ -n "$DESC" ] && [ -n "$OUTBOX" ]; then
+python3 - "$OUTBOX" "$SLUG" "$DESC" "$URL" "$GRUPO" <<'PYEOF'
+import json, sys, os
+outbox, slug, desc, url, grupo = sys.argv[1:6]
+fila = json.load(open(outbox)) if os.path.exists(outbox) else []
+titulo = slug.replace('-', ' ').title()
+fila.append({"grupo": grupo, "texto": f"🔗 *{titulo}* (link limpo)\n{desc}\n\n{url}"})
+json.dump(fila, open(outbox, 'w'), ensure_ascii=False, indent=1)
+PYEOF
 fi
