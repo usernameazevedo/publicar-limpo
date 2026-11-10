@@ -83,4 +83,4 @@ MIT. Veja [LICENSE](LICENSE).
 
 ## Autor
 
-Luis Azevedo · username.azevedo@gmail.com
+Luis Azevedo · contato@midianoxx.com
